@@ -236,8 +236,9 @@ class SalienceDETR(DNDETRDetector):
         }
         if self.aux_loss:
             output["aux_outputs"] = self._set_aux_loss(outputs_class, outputs_coord)
-                # ========= 3) RoI 精修分支（QC-RoIFormer），只在训练时启用 =========
-        if self.roi_refine_head is not None and self.training:
+
+        # ========= 3) RoI 精修分支（QC-RoIFormer），训练与推理均可用 =========
+        if self.roi_refine_head is not None:
             pred_logits = output["pred_logits"]      # [B, Q, num_classes+1]
             pred_boxes = output["pred_boxes"]        # [B, Q, 4], normalized cxcywh
             B, Q, _ = pred_boxes.shape
@@ -282,11 +283,15 @@ class SalienceDETR(DNDETRDetector):
                 # 用 tanh 限制修正幅度，避免刚开始把框改飞
                 refined_boxes[b, idx] = refined_boxes[b, idx] + delta_b.tanh() * 0.1
 
-            # 7) 构造 refine 分支；分类 logits 暂不更新
-            output["refine_outputs"] = {
-                "pred_logits": pred_logits.detach(),
-                "pred_boxes": refined_boxes,
-            }
+            if self.training:
+                # 训练阶段保留原框供主损失使用，精修结果用于附加监督
+                output["refine_outputs"] = {
+                    "pred_logits": pred_logits.detach(),
+                    "pred_boxes": refined_boxes,
+                }
+            else:
+                # 推理阶段直接使用精修后的框进行后处理
+                output["pred_boxes"] = refined_boxes
 
         # ========= 4) enc_outputs（两阶段输出） =========
         output["enc_outputs"] = {"pred_logits": enc_class, "pred_boxes": enc_coord}
