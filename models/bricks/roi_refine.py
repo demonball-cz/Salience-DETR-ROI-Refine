@@ -1,3 +1,4 @@
+# models/bricks/roi_refine.py
 import torch
 import torch.nn as nn
 from torchvision.ops import RoIAlign
@@ -6,9 +7,8 @@ class RoIDecoder(nn.Module):
     """
     Query-Conditioned RoI Transformer 解码器：
     - RoIAlign 得到局部特征 -> patch tokens
-    - 加入 roi_token + 对应的 global query token
-    - 在同一个 Transformer 里做 self-attention
-    - 最后用 roi_token 回归 Δbbox (tx, ty, tw, th)
+    - 将 global decoder 的 query token、roi_token 与 patch tokens 拼成一个序列
+    - 用局部 Transformer 编码，最后用 roi_token 回归 Δbbox
     """
     def __init__(self,
                  feat_channels=256,
@@ -26,7 +26,6 @@ class RoIDecoder(nn.Module):
         )
         self.roi_size = roi_size
         self.feat_channels = feat_channels
-
         self.token_dim = feat_channels
 
         # 局部 Transformer（self-attention）
@@ -38,12 +37,12 @@ class RoIDecoder(nn.Module):
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
 
-        # RoI 内的相对位置编码（patch tokens）
+        # RoI 内 patch 的位置编码
         num_patches = roi_size * roi_size
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, self.token_dim))
         nn.init.trunc_normal_(self.pos_embed, std=0.02)
 
-        # RoI token 初始向量
+        # RoI token
         self.roi_token = nn.Parameter(torch.zeros(1, 1, self.token_dim))
         nn.init.trunc_normal_(self.roi_token, std=0.02)
 
@@ -56,26 +55,24 @@ class RoIDecoder(nn.Module):
 
     def forward(self, feat, boxes, input_hw, topk_indices, global_queries):
         """
-        feat: [B, C, Hf, Wf]  高分辨率特征
-        boxes: [B, Q, 4]      cxcywh, normalized w.r.t (H_in, W_in)
-        input_hw: (H_in, W_in)  当前 batch 网络输入尺寸（padding 后）
-        topk_indices: list[Tensor]，每张图选出来的 topK query 下标
+        feat: [B, C, Hf, Wf]  高分辨率特征（比如 stride=8）
+        boxes: [B, Q, 4]      cxcywh, 归一化到 (H_in, W_in)
+        input_hw: (H_in, W_in) 当前 batch 的网络输入尺寸（padding 后）
+        topk_indices: List[Tensor]，每张图选出来的 topK query 下标
         global_queries: [B, Q, C]  全局 decoder 最后一层的 query 特征 hs[-1]
         """
         device = feat.device
         B, C, Hf, Wf = feat.shape
-
-        # 根据特征 stride 和输入尺寸生成 RoI 像素坐标
         H_in, W_in = input_hw
-        # 也可以用 feat 的大小推回 stride：stride = H_in / Hf
 
         all_rois = []
         batch_ids = []
         all_query_tokens = []
 
+        # 1) 生成 RoI（像素坐标）及对应的 global query token
         for b in range(B):
-            idx = topk_indices[b]          # [K]
-            boxes_b = boxes[b, idx]        # [K, 4]
+            idx = topk_indices[b]              # [K]
+            boxes_b = boxes[b, idx]            # [K, 4]
             cx, cy, bw, bh = boxes_b.unbind(-1)
 
             x1 = (cx - bw / 2.0) * W_in
@@ -87,20 +84,20 @@ class RoIDecoder(nn.Module):
             all_rois.append(rois_b)
             batch_ids.append(torch.full((idx.numel(),), b, device=device, dtype=torch.float32))
 
-            # 对应的 global query token 作为 query-conditioned token
+            # query-conditioned：取对应 query 的 embedding 作为 query token
             qfeat_b = global_queries[b, idx]   # [K, C]
             all_query_tokens.append(qfeat_b)
 
-        rois = torch.cat(all_rois, dim=0)                       # [B*K, 4]
-        batch_ids = torch.cat(batch_ids, dim=0).unsqueeze(1)    # [B*K, 1]
-        rois_input = torch.cat([batch_ids, rois], dim=1)        # [B*K, 5]
+        rois = torch.cat(all_rois, dim=0)                        # [B*K, 4]
+        batch_ids = torch.cat(batch_ids, dim=0).unsqueeze(1)     # [B*K, 1]
+        rois_input = torch.cat([batch_ids, rois], dim=1)         # [B*K, 5]
 
-        query_tokens = torch.cat(all_query_tokens, dim=0)       # [B*K, C]
+        query_tokens = torch.cat(all_query_tokens, dim=0)        # [B*K, C]
 
         # 2) RoIAlign 得到局部特征
-        roi_feat = self.roi_align(feat, rois_input)             # [B*K, C, roi, roi]
+        roi_feat = self.roi_align(feat, rois_input)              # [B*K, C, roi, roi]
 
-        # 3) 构造 patch tokens + query_token + roi_token
+        # 3) 构造序列：[query_token, roi_token, patch_tokens]
         Bk, C, Hroi, Wroi = roi_feat.shape
         assert Hroi == self.roi_size and Wroi == self.roi_size
 
@@ -115,14 +112,13 @@ class RoIDecoder(nn.Module):
         # roi_token: [1,1,C] -> [Bk,1,C]
         roi_token = self.roi_token.expand(Bk, -1, -1)            # [Bk, 1, C]
 
-        # 序列：[query_token, roi_token, patch_tokens]
         tokens = torch.cat([query_token, roi_token, patch_tokens], dim=1)  # [Bk, 2+N, C]
 
-        # 4) Transformer 编码（统一 self-attention）
+        # 4) 局部 Transformer 编码（self-attention）
         tokens = self.transformer(tokens)                        # [Bk, 2+N, C]
 
-        # 5) 取 roi_token（第 1 个）做回归
+        # 5) 取第 1 个位置（roi_token）做回归
         roi_repr = tokens[:, 1, :]                               # [Bk, C]
-        deltas = self.mlp_head(roi_repr)                         # [Bk, 4] (tx, ty, tw, th 或简单偏移)
+        deltas = self.mlp_head(roi_repr)                         # [Bk, 4]
 
         return deltas

@@ -215,74 +215,81 @@ class SalienceDETR(DNDETRDetector):
             noised_box_query,
             attn_mask=attn_mask,
         )
+        global_queries = hs[-1]
+
         # hack implementation for distributed training
-        outputs_class[0] += self.denoising_generator.label_encoder.weight[0, 0] * 0.0 
-        # denoising postprocessing
-        if denoising_groups is not None and max_gt_num_per_image is not None: 
-            dn_metas = { 
+        outputs_class[0] += self.denoising_generator.label_encoder.weight[0, 0] * 0.0
+
+        # ====== 1) denoising post-processing（可有可无） ======
+        dn_metas = None
+        if denoising_groups is not None and max_gt_num_per_image is not None:
+            dn_metas = {
                 "denoising_groups": denoising_groups,
                 "max_gt_num_per_image": max_gt_num_per_image,
-            } 
-            outputs_class, outputs_coord = self.dn_post_process(outputs_class, outputs_coord, dn_metas) 
-            # prepare for loss computation
-            output = {"pred_logits": outputs_class[-1], "pred_boxes": outputs_coord[-1]} 
-            if self.aux_loss: 
-                output["aux_outputs"] = self._set_aux_loss(outputs_class, outputs_coord) 
-            # ========= RoI 精修分支（QC-RoIFormer） =========
-            if self.roi_refine_head is not None and self.training: 
-                pred_logits = output["pred_logits"]      # [B, Q, num_classes+1]
-                pred_boxes = output["pred_boxes"]        # [B, Q, 4], cxcywh, normalized
-                B, Q, _ = pred_boxes.shape 
+            }
+            outputs_class, outputs_coord = self.dn_post_process(outputs_class, outputs_coord, dn_metas)
 
-                # 1) 每个 query 的最高类别分数（忽略最后一个背景类）
-                prob = pred_logits.softmax(-1)[..., :-1]   # [B, Q, num_classes]
-                scores, _ = prob.max(-1)                   # [B, Q]
+        # ====== 2) 统一构造 output（无论是否有 DN） ======
+        output = {
+            "pred_logits": outputs_class[-1],
+            "pred_boxes": outputs_coord[-1],
+        }
+        if self.aux_loss:
+            output["aux_outputs"] = self._set_aux_loss(outputs_class, outputs_coord)
+                # ========= 3) RoI 精修分支（QC-RoIFormer），只在训练时启用 =========
+        if self.roi_refine_head is not None and self.training:
+            pred_logits = output["pred_logits"]      # [B, Q, num_classes+1]
+            pred_boxes = output["pred_boxes"]        # [B, Q, 4], normalized cxcywh
+            B, Q, _ = pred_boxes.shape
 
-                # 2) 为每张图选出 top-K query
-                topk_indices = []
-                for b in range(B):
-                    k = min(self.roi_topk, Q)
-                    topk = torch.topk(scores[b], k=k, dim=0).indices  # [K]
-                    topk_indices.append(topk)
+            # 1) 每个 query 的最高类别分数（忽略 no-object）
+            prob = pred_logits.softmax(-1)[..., :-1]  # [B, Q, num_classes]
+            scores, _ = prob.max(-1)                  # [B, Q]
 
-                # 3) 网络输入尺寸（padding 后）
-                H_in, W_in = images.tensors.shape[-2:]
-                input_hw = (H_in, W_in)
+            # 2) 为每张图选出 top-K query
+            topk_indices = []
+            for b in range(B):
+                k = min(self.roi_topk, Q)
+                topk = torch.topk(scores[b], k=k, dim=0).indices  # [K]
+                topk_indices.append(topk)
 
-                # 4) 选一个较高分辨率的特征图，假设 multi_level_feats[0] 是 stride=8 的最高分辨率
-                high_res_feat = multi_level_feats[0]       # [B, C, Hf, Wf]
+            # 3) 网络输入尺寸（padding 后）
+            H_in, W_in = images.tensors.shape[-2:]
+            input_hw = (H_in, W_in)
 
-                # 5) 全局 decoder 最后一层 query 特征（用于 query-conditioned）
-                global_queries = hs[-1]                    # [B, Q, C]
+            # 4) 高分辨率特征 & global queries
+            high_res_feat = multi_level_feats[0]   # [B, C, Hf, Wf]（假设 stride=8）
+            global_queries = hs[-1]                # [B, Q, C]
 
-                # 6) 调用 QC-RoIFormer，得到 top-K 的 Δbbox
-                deltas = self.roi_refine_head(
-                    high_res_feat,      # [B, C, Hf, Wf]
-                    pred_boxes,         # [B, Q, 4] normalized cxcywh
-                    input_hw,           # (H_in, W_in)
-                    topk_indices,       # List[Tensor(K,)]
-                    global_queries,     # [B, Q, C]
-                )   # [B*K, 4]
+            # 5) 调用 QC-RoIFormer，得到 Δbbox
+            deltas = self.roi_refine_head(
+                high_res_feat,
+                pred_boxes,
+                input_hw,
+                topk_indices,
+                global_queries,
+            )  # [B*K, 4]
 
-                # 7) 把 Δbbox 加到对应 query 的 box 上（只改 top-K，其余保持原样）
-                refined_boxes = pred_boxes.clone()
-                offset = 0
-                for b in range(B):
-                    idx = topk_indices[b]          # [K]
-                    K = idx.numel()
-                    delta_b = deltas[offset:offset + K]   # [K, 4]
-                    offset += K
-                    # 用 tanh 限制修正幅度，避免刚开始把框改飞
-                    refined_boxes[b, idx] = refined_boxes[b, idx] + delta_b.tanh() * 0.1
+            # 6) 把 Δbbox 加到对应 query 的 box 上（只改 top-K，其余保持原样）
+            refined_boxes = pred_boxes.clone()
+            offset = 0
+            for b in range(B):
+                idx = topk_indices[b]      # [K]
+                K = idx.numel()
+                delta_b = deltas[offset:offset + K]  # [K, 4]
+                offset += K
 
-                # 8) 构造 refine 分支；分类 logits 暂时不改，用原结果（可 detach）
-                output["refine_outputs"] = {
-                    "pred_logits": pred_logits.detach(),  # 不改分类，只精修 box
-                    "pred_boxes": refined_boxes,
-                }
-            # ========= RoI 精修分支结束 ========= 
-            # prepare two stage output 
-            output["enc_outputs"] = {"pred_logits": enc_class, "pred_boxes": enc_coord}
+                # 用 tanh 限制修正幅度，避免刚开始把框改飞
+                refined_boxes[b, idx] = refined_boxes[b, idx] + delta_b.tanh() * 0.1
+
+            # 7) 构造 refine 分支；分类 logits 暂不更新
+            output["refine_outputs"] = {
+                "pred_logits": pred_logits.detach(),
+                "pred_boxes": refined_boxes,
+            }
+
+        # ========= 4) enc_outputs（两阶段输出） =========
+        output["enc_outputs"] = {"pred_logits": enc_class, "pred_boxes": enc_coord}
 
         if self.training:
             # compute loss
@@ -303,5 +310,6 @@ class SalienceDETR(DNDETRDetector):
             loss_dict = dict((k, loss_dict[k] * weight_dict[k]) for k in loss_dict.keys() if k in weight_dict)
             return loss_dict
 
+        # eval 模式：output 一定已经被定义
         detections = self.postprocessor(output, original_image_sizes)
         return detections

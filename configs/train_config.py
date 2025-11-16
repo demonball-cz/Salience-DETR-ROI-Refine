@@ -13,7 +13,7 @@ print_freq = 10   # frequency to print logs
 starting_epoch = 0
 max_norm = 0.1    # clip gradient norm
 
-output_dir = "/data/HDD2-8T/chenz/salience_detr_resnet50_800_1333/train/"  # path to save checkpoints, default for None: checkpoints/{model_name}
+output_dir = "/data/HDD2-8T/chenz/salience_detr_resnet50_800_1333/train/QC-RoIFormer/"  # path to save checkpoints, default for None: checkpoints/{model_name}
 find_unused_parameters = False  # useful for debugging distributed training
 
 # define dataset for train
