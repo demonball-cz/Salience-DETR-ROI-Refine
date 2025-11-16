@@ -21,6 +21,10 @@ def train_one_epoch_acc(
 ):
     logger = logging.getLogger(os.path.basename(os.getcwd()) + "." + __name__)
     model.train()
+    if hasattr(model, "set_epoch"):
+        model.set_epoch(epoch)
+    elif hasattr(model, "module") and hasattr(model.module, "set_epoch"):
+        model.module.set_epoch(epoch)
     metric_logger = utils.MetricLogger(delimiter="  ")
     metric_logger.add_meter("lr", utils.SmoothedValue(window_size=1, fmt="{value:.6f}"))
     metric_logger.add_meter("data_time", utils.SmoothedValue(fmt="{avg:.4f}"))

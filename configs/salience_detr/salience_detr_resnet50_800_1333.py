@@ -92,6 +92,10 @@ weight_dict.update({
 })
 weight_dict.update({"loss_class_enc": 1, "loss_bbox_enc": 5, "loss_giou_enc": 2})
 weight_dict.update({"loss_salience": 2})
+weight_dict.update({
+    "loss_bbox_refine": 1.0,   # 比原 loss_bbox 的 5 小一点
+    "loss_giou_refine": 1.0,   # 比原 loss_giou 的 2 小一点
+})
 
 criterion = HybridSetCriterion(num_classes, matcher=matcher, weight_dict=weight_dict, alpha=0.25, gamma=2.0)
 foreground_criterion = SalienceCriterion(noise_scale=0.0, alpha=0.25, gamma=2.0)

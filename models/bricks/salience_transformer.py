@@ -221,7 +221,7 @@ class SalienceTransformer(TwostageTransformer):
             reference_points = torch.cat([noised_box_query.sigmoid(), reference_points], 1)
 
         # decoder
-        outputs_classes, outputs_coords = self.decoder(
+        outputs_classes, outputs_coords,hs = self.decoder(
             query=target,
             value=memory,
             key_padding_mask=mask_flatten,
@@ -232,7 +232,7 @@ class SalienceTransformer(TwostageTransformer):
             attn_mask=attn_mask,
         )
 
-        return outputs_classes, outputs_coords, enc_outputs_class, enc_outputs_coord, salience_score
+        return outputs_classes, outputs_coords, enc_outputs_class, enc_outputs_coord, salience_score,hs
 
     @staticmethod
     def fast_repeat_interleave(input, repeats):
@@ -636,6 +636,8 @@ class SalienceTransformerDecoder(nn.Module):
     ):
         outputs_classes = []
         outputs_coords = []
+        intermediate_queries = []     # ⭐ 新增，用来存每一层的 query 特征
+
         valid_ratio_scale = torch.cat([valid_ratios, valid_ratios], -1)[:, None]
 
         for layer_idx, layer in enumerate(self.layers):
@@ -655,9 +657,13 @@ class SalienceTransformerDecoder(nn.Module):
                 self_attn_mask=attn_mask,
             )
 
-            # get output, reference_points are not detached for look_forward_twice
-            output_class = self.class_head[layer_idx](self.norm(query))
-            output_coord = self.bbox_head[layer_idx](self.norm(query)) + inverse_sigmoid(reference_points)
+            # 先做一次 LayerNorm，既给 head 用，也存下来
+            norm_query = self.norm(query)       # [B, Q, C]
+            intermediate_queries.append(norm_query)
+
+            # get output
+            output_class = self.class_head[layer_idx](norm_query)
+            output_coord = self.bbox_head[layer_idx](norm_query) + inverse_sigmoid(reference_points)
             output_coord = output_coord.sigmoid()
             outputs_classes.append(output_class)
             outputs_coords.append(output_coord)
@@ -665,10 +671,12 @@ class SalienceTransformerDecoder(nn.Module):
             if layer_idx == self.num_layers - 1:
                 break
 
-            # iterative bounding box refinement
+            # iterative bounding box refinement（注意这里用未 norm 的 query）
             reference_points = self.bbox_head[layer_idx](query) + inverse_sigmoid(reference_points.detach())
             reference_points = reference_points.sigmoid()
 
-        outputs_classes = torch.stack(outputs_classes)
-        outputs_coords = torch.stack(outputs_coords)
-        return outputs_classes, outputs_coords
+        outputs_classes = torch.stack(outputs_classes)          # [L, B, Q, num_classes]
+        outputs_coords = torch.stack(outputs_coords)            # [L, B, Q, 4]
+        hs = torch.stack(intermediate_queries)                  # [L, B, Q, C]  ⭐
+
+        return outputs_classes, outputs_coords, hs

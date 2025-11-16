@@ -4,10 +4,12 @@ import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
 from torchvision.ops import boxes as box_ops
+from torchvision.ops import batched_nms  # 如果之后你想 NMS，这里可选
 
 from models.bricks.denoising import GenerateCDNQueries
 from models.bricks.losses import sigmoid_focal_loss
 from models.detectors.base_detector import DNDETRDetector
+from models.bricks.roi_refine import RoIDecoder
 
 
 class SalienceCriterion(nn.Module):
@@ -137,7 +139,14 @@ class SalienceDETR(DNDETRDetector):
         min_size: int = None,
         max_size: int = None,
     ):
+        
         super().__init__(min_size, max_size)
+        self.roi_refine_head = RoIDecoder(
+            feat_channels=256,   # 一般是 transformer 的 d_model，ResNet50 默认 256
+            roi_size=7,
+            spatial_scale=1/8.,         # 这里先假定你用 stride=8 的特征图
+        )
+        self.roi_topk = 50             # 每张图选多少个框做精修，可以调
         # define model parameters
         self.num_classes = num_classes
         self.aux_loss = aux_loss
@@ -159,6 +168,11 @@ class SalienceDETR(DNDETRDetector):
             box_noise_scale=1.0,
         )
         self.focus_criterion = focus_criterion
+        self.roi_warmup_epochs = 12  # 你想要的 warmup 时长
+        self.current_epoch = 0  
+
+    def set_epoch(self, epoch: int):
+        self.current_epoch = epoch
 
     def forward(self, images: List[Tensor], targets: List[Dict] = None):
         # get original image sizes, used for postprocess
@@ -193,7 +207,7 @@ class SalienceDETR(DNDETRDetector):
             max_gt_num_per_image = None
 
         # feed into transformer
-        outputs_class, outputs_coord, enc_class, enc_coord, foreground_mask = self.transformer(
+        outputs_class, outputs_coord, enc_class, enc_coord, foreground_mask, hs = self.transformer(
             multi_level_feats,
             multi_level_masks,
             multi_level_position_embeddings,
@@ -202,23 +216,73 @@ class SalienceDETR(DNDETRDetector):
             attn_mask=attn_mask,
         )
         # hack implementation for distributed training
-        outputs_class[0] += self.denoising_generator.label_encoder.weight[0, 0] * 0.0
-
+        outputs_class[0] += self.denoising_generator.label_encoder.weight[0, 0] * 0.0 
         # denoising postprocessing
-        if denoising_groups is not None and max_gt_num_per_image is not None:
-            dn_metas = {
+        if denoising_groups is not None and max_gt_num_per_image is not None: 
+            dn_metas = { 
                 "denoising_groups": denoising_groups,
                 "max_gt_num_per_image": max_gt_num_per_image,
-            }
-            outputs_class, outputs_coord = self.dn_post_process(outputs_class, outputs_coord, dn_metas)
-
+            } 
+            outputs_class, outputs_coord = self.dn_post_process(outputs_class, outputs_coord, dn_metas) 
             # prepare for loss computation
-        output = {"pred_logits": outputs_class[-1], "pred_boxes": outputs_coord[-1]}
-        if self.aux_loss:
-            output["aux_outputs"] = self._set_aux_loss(outputs_class, outputs_coord)
+            output = {"pred_logits": outputs_class[-1], "pred_boxes": outputs_coord[-1]} 
+            if self.aux_loss: 
+                output["aux_outputs"] = self._set_aux_loss(outputs_class, outputs_coord) 
+            # ========= RoI 精修分支（QC-RoIFormer） =========
+            if self.roi_refine_head is not None and self.training: 
+                pred_logits = output["pred_logits"]      # [B, Q, num_classes+1]
+                pred_boxes = output["pred_boxes"]        # [B, Q, 4], cxcywh, normalized
+                B, Q, _ = pred_boxes.shape 
 
-        # prepare two stage output
-        output["enc_outputs"] = {"pred_logits": enc_class, "pred_boxes": enc_coord}
+                # 1) 每个 query 的最高类别分数（忽略最后一个背景类）
+                prob = pred_logits.softmax(-1)[..., :-1]   # [B, Q, num_classes]
+                scores, _ = prob.max(-1)                   # [B, Q]
+
+                # 2) 为每张图选出 top-K query
+                topk_indices = []
+                for b in range(B):
+                    k = min(self.roi_topk, Q)
+                    topk = torch.topk(scores[b], k=k, dim=0).indices  # [K]
+                    topk_indices.append(topk)
+
+                # 3) 网络输入尺寸（padding 后）
+                H_in, W_in = images.tensors.shape[-2:]
+                input_hw = (H_in, W_in)
+
+                # 4) 选一个较高分辨率的特征图，假设 multi_level_feats[0] 是 stride=8 的最高分辨率
+                high_res_feat = multi_level_feats[0]       # [B, C, Hf, Wf]
+
+                # 5) 全局 decoder 最后一层 query 特征（用于 query-conditioned）
+                global_queries = hs[-1]                    # [B, Q, C]
+
+                # 6) 调用 QC-RoIFormer，得到 top-K 的 Δbbox
+                deltas = self.roi_refine_head(
+                    high_res_feat,      # [B, C, Hf, Wf]
+                    pred_boxes,         # [B, Q, 4] normalized cxcywh
+                    input_hw,           # (H_in, W_in)
+                    topk_indices,       # List[Tensor(K,)]
+                    global_queries,     # [B, Q, C]
+                )   # [B*K, 4]
+
+                # 7) 把 Δbbox 加到对应 query 的 box 上（只改 top-K，其余保持原样）
+                refined_boxes = pred_boxes.clone()
+                offset = 0
+                for b in range(B):
+                    idx = topk_indices[b]          # [K]
+                    K = idx.numel()
+                    delta_b = deltas[offset:offset + K]   # [K, 4]
+                    offset += K
+                    # 用 tanh 限制修正幅度，避免刚开始把框改飞
+                    refined_boxes[b, idx] = refined_boxes[b, idx] + delta_b.tanh() * 0.1
+
+                # 8) 构造 refine 分支；分类 logits 暂时不改，用原结果（可 detach）
+                output["refine_outputs"] = {
+                    "pred_logits": pred_logits.detach(),  # 不改分类，只精修 box
+                    "pred_boxes": refined_boxes,
+                }
+            # ========= RoI 精修分支结束 ========= 
+            # prepare two stage output 
+            output["enc_outputs"] = {"pred_logits": enc_class, "pred_boxes": enc_coord}
 
         if self.training:
             # compute loss

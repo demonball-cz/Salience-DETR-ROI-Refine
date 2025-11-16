@@ -105,6 +105,66 @@ class SetCriterion(nn.Module):
         losses["loss_giou"] = loss_giou.sum() / num_boxes
         return losses
 
+    def loss_mir(self, outputs, targets, num_boxes):
+        if "aux_outputs" not in outputs:
+            return {"loss_mir": outputs["pred_boxes"].sum() * 0.0}
+
+        matching_outputs = {k: v for k, v in outputs.items()
+                            if k != "aux_outputs" and k != "enc_outputs"}
+        gt_boxes, gt_labels = list(zip(*map(lambda x: (x["boxes"], x["labels"]), targets)))
+        pred_logits = matching_outputs["pred_logits"]
+        pred_boxes = matching_outputs["pred_boxes"]
+        indices = list(map(self.matcher, pred_boxes, pred_logits, gt_boxes, gt_labels))
+
+        idx = self._get_src_permutation_idx(indices)
+        target_boxes = torch.cat(
+            [t["boxes"][i] for t, (_, i) in zip(targets, indices)],
+            dim=0
+        )
+
+        all_pred_boxes = []
+        for aux_out in outputs["aux_outputs"]:
+            all_pred_boxes.append(aux_out["pred_boxes"])
+        all_pred_boxes.append(outputs["pred_boxes"])
+
+        iou_per_layer = []
+        for pred in all_pred_boxes:
+            src_boxes = pred[idx]
+            iou_mat = box_ops.box_iou(
+                box_ops._box_cxcywh_to_xyxy(src_boxes),
+                box_ops._box_cxcywh_to_xyxy(target_boxes),
+            )
+            ious = torch.diag(iou_mat)  # [num_matched]
+            iou_per_layer.append(ious)
+
+        if len(iou_per_layer) <= 1:
+            return {"loss_mir": outputs["pred_boxes"].sum() * 0.0}
+
+        # ----------✅ STEP A: 计算用于过滤的 IoU（比如最后一层） ----------
+        iou_last = iou_per_layer[-1].detach()          # [num_matched]
+        mask = iou_last > 0.3                          # 只保留 IoU>=0.3 的匹配
+
+        # 如果当前 batch 一个都没达到阈值，就直接返回 0 loss
+        if mask.sum() == 0:
+            return {"loss_mir": outputs["pred_boxes"].sum() * 0.0}
+
+        # ----------✅ STEP B: 只对 mask 内样本计算单调约束 ----------
+        mir_loss = 0.0
+        margin = 0.01  # 允许一点点波动，不至于太硬
+
+        for l in range(len(iou_per_layer) - 1):
+            iou_l = iou_per_layer[l][mask]
+            iou_next = iou_per_layer[l + 1][mask]
+            diff = (iou_l - iou_next - margin).clamp(min=0.0)
+            mir_loss = mir_loss + diff.sum()
+
+        # ----------✅ STEP C: 归一化 ----------
+        mir_loss = mir_loss / num_boxes
+
+        return {"loss_mir": mir_loss}
+
+
+
     def _get_src_permutation_idx(self, indices):
         # permute predictions following indices
         batch_idx = torch.cat([torch.full_like(src, i) for i, (src, _) in enumerate(indices)])
@@ -130,6 +190,44 @@ class SetCriterion(nn.Module):
         losses.update(loss_boxes)
         return losses
 
+    def loss_bbox_only_refine(self, refine_outputs, targets, num_boxes, final_indices, base_boxes):
+        """
+        只计算 refine 后 bbox/GIoU 的损失：
+        - 复用最终层的 matching indices(final_indices)
+        - 只在 IoU>=0.3 的 matched 上计算（门控）
+        base_boxes: 最终层未 refine 的 boxes（用于计算门控 IoU）
+        """
+        # 门控：计算最终层（base）与 GT 的 IoU，用于 mask
+        idx = self._get_src_permutation_idx(final_indices)
+        base_src = base_boxes[idx]
+        tgt_boxes = torch.cat([t["boxes"][i] for t, (_, i) in zip(targets, final_indices)], dim=0)
+
+        with torch.no_grad():
+            base_iou = torch.diag(
+                box_ops.box_iou(
+                    box_ops._box_cxcywh_to_xyxy(base_src),
+                    box_ops._box_cxcywh_to_xyxy(tgt_boxes),
+                )
+            )
+            gate = base_iou > 0.3
+            if gate.sum() == 0:
+                return {"loss_bbox_refine": refine_outputs["pred_boxes"].sum() * 0.0,
+                        "loss_giou_refine": refine_outputs["pred_boxes"].sum() * 0.0}
+
+        # 只取门控内的样本
+        ref_src = refine_outputs["pred_boxes"][idx][gate]
+        tgt_sel = tgt_boxes[gate]
+
+        loss_bbox = F.l1_loss(ref_src, tgt_sel, reduction="none").sum() / num_boxes
+        loss_giou = (1.0 - torch.diag(
+            box_ops.generalized_box_iou(
+                box_ops._box_cxcywh_to_xyxy(ref_src),
+                box_ops._box_cxcywh_to_xyxy(tgt_sel),
+            )
+        )).sum() / num_boxes
+
+        return {"loss_bbox_refine": loss_bbox, "loss_giou_refine": loss_giou}
+
     def forward(self, outputs, targets):
         """This performs the loss computation
 
@@ -149,12 +247,16 @@ class SetCriterion(nn.Module):
         # Compute all the requested losses
         losses = {}
         matching_outputs = {k: v for k, v in outputs.items() if k != "aux_outputs" and k != "enc_outputs"}
-        losses.update(self.calculate_loss(matching_outputs, targets, num_boxes))
+        gt_boxes, gt_labels = list(zip(*map(lambda x: (x["boxes"], x["labels"]), targets)))
+        pred_logits = matching_outputs["pred_logits"]
+        pred_boxes = matching_outputs["pred_boxes"]
+        final_indices = list(map(self.matcher, pred_boxes, pred_logits, gt_boxes, gt_labels))
 
-        # In case of auxiliary losses, we repeat this process with the output of each intermediate layer.
+        # 1) 原损失：保持原逻辑(每层各自匹配)
+        losses = {}
+        losses.update(self.calculate_loss(matching_outputs, targets, num_boxes))
         if "aux_outputs" in outputs:
             for i, aux_outputs in enumerate(outputs["aux_outputs"]):
-                # get matching results for each image
                 losses_aux = self.calculate_loss(aux_outputs, targets, num_boxes)
                 losses.update({k + f"_{i}": v for k, v in losses_aux.items()})
 
@@ -166,6 +268,14 @@ class SetCriterion(nn.Module):
                     bt["labels"] = torch.zeros_like(bt["labels"])
             losses_enc = self.calculate_loss(enc_outputs, bin_targets, num_boxes)
             losses.update({k + f"_enc": v for k, v in losses_enc.items()})
+
+        # 2) MIR（可选）：用 final_indices；你已有 loss_mir，就不改了
+        if "aux_outputs" in outputs and "loss_mir" in self.weight_dict:
+            losses.update(self.loss_mir(outputs, targets, num_boxes))
+
+        # 3) RoI refine：仅 bbox/GIoU + 复用 final_indices + IoU门控
+        if "refine_outputs" in outputs and "loss_bbox_refine" in self.weight_dict:
+            losses.update(self.loss_bbox_only_refine(outputs["refine_outputs"], targets, num_boxes, final_indices, pred_boxes))
 
         return losses
 

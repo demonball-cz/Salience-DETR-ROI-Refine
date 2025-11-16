@@ -9,15 +9,15 @@ num_epochs = 12   # train epochs
 batch_size = 2    # total_batch_size = #GPU x batch_size
 num_workers = 4   # workers for pytorch DataLoader
 pin_memory = True # whether pin_memory for pytorch DataLoader
-print_freq = 50   # frequency to print logs
+print_freq = 10   # frequency to print logs
 starting_epoch = 0
 max_norm = 0.1    # clip gradient norm
 
-output_dir = None  # path to save checkpoints, default for None: checkpoints/{model_name}
+output_dir = "/data/HDD2-8T/chenz/salience_detr_resnet50_800_1333/train/"  # path to save checkpoints, default for None: checkpoints/{model_name}
 find_unused_parameters = False  # useful for debugging distributed training
 
 # define dataset for train
-coco_path = "data/coco"  # /PATH/TO/YOUR/COCODIR
+coco_path = "/home/chenz/datasets/NWPUVHR-10"  # /PATH/TO/YOUR/COCODIR
 train_transform = presets.detr  # see transforms/presets to choose a transform
 train_dataset = CocoDetection(
     img_folder=f"{coco_path}/train2017",
